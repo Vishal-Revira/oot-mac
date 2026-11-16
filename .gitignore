@@ -1,0 +1,20 @@
+# Never commit game data, keys, builds or saves
+nxnative/
+*.nup
+*.nsp
+*.xci
+*.nsz
+*.xcz
+*.keys
+*.app/
+*.ipa
+*.img
+*.metallib
+romfs/
+exefs/
+save/
+*.png
+*.tsv
+*.log
+.DS_Store
+__pycache__/

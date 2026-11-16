@@ -1,0 +1,68 @@
+diff --git a/dm/gfx/nvn/dmsh_chain.h b/dm/gfx/nvn/dmsh_chain.h
+index 4c3f8cec..d734f89f 100644
+--- a/dm/gfx/nvn/dmsh_chain.h
++++ b/dm/gfx/nvn/dmsh_chain.h
+@@ -1,3 +1,3 @@
+ // Generated file (dm/gfx/tools/dmsh_chain.py --header): the B shader library translation chain version this source tree expects (default options), one for every game;
+ // the host loads only <library dir>/b-<V>/. Run dmsh_chain.py --header after changing the chain's tools and commit this file with the change
+-#define DMSH_CHAIN "9c1a9324c032"
++#define DMSH_CHAIN "4936c5d925b2"
+diff --git a/dm/gfx/tests/test_dmsh_ampere_alu.py b/dm/gfx/tests/test_dmsh_ampere_alu.py
+index 6303c6af..f0fcb8c1 100644
+--- a/dm/gfx/tests/test_dmsh_ampere_alu.py
++++ b/dm/gfx/tests/test_dmsh_ampere_alu.py
+@@ -44,7 +44,7 @@ class FloatRed(Translated):
+                 msl = self.translate(code, nvn2_cs=[0, 1, 0, 0x20, 0], reduced=reduced)
+                 self.assertIn('cp_s0', msl)   # traced to the storage buffer, not the memory pool table
+                 out = dmsh_rewrite.float_add_msl(msl)
+-                self.assertRegex(out, r'atomic_fetch_add_explicit\(\(device atomic_float\*\)&\(\*spvDescriptorSet0\.cp_s0\)\._m0\[0\], _\d+, memory_order_relaxed\);')
++                self.assertRegex(out, r'atomic_fetch_add_explicit\(\(device atomic_float\*\)&\(\*spvDescriptorSet0\.cp_s0\)\._m0\[0\], dm_fa, memory_order_relaxed\);')
+                 self.assertNotIn('atomic_compare_exchange_weak_explicit', out)
+ 
+ 
+diff --git a/dm/gfx/tests/test_dmsh_float_add.py b/dm/gfx/tests/test_dmsh_float_add.py
+index a740ad32..441edcc9 100644
+--- a/dm/gfx/tests/test_dmsh_float_add.py
++++ b/dm/gfx/tests/test_dmsh_float_add.py
+@@ -47,12 +47,13 @@ class FloatAdd(unittest.TestCase):
+     def test_loop_becomes_one_atomic_add(self):
+         src = loop('(*spvDescriptorSet0.cp_s4)', 0, '_2580', 10) + loop('(*spvDescriptorSet0.cp_s4)', 'int(_7)', '_2572', 20)
+         out = float_add_msl(src)
+-        self.assertEqual(out, '    atomic_fetch_add_explicit((device atomic_float*)&(*spvDescriptorSet0.cp_s4)._m0[0], _2580, memory_order_relaxed);\n'
+-                              '    atomic_fetch_add_explicit((device atomic_float*)&(*spvDescriptorSet0.cp_s4)._m0[int(_7)], _2572, memory_order_relaxed);\n')
++        # the add only for a value that is not zero: the bare add failed a compute pipeline on an M5 (dmsh_rewrite.py float_add_msl)
++        self.assertEqual(out, '    { float dm_fa = _2580; if (dm_fa != 0.0f) atomic_fetch_add_explicit((device atomic_float*)&(*spvDescriptorSet0.cp_s4)._m0[0], dm_fa, memory_order_relaxed); }\n'
++                              '    { float dm_fa = _2572; if (dm_fa != 0.0f) atomic_fetch_add_explicit((device atomic_float*)&(*spvDescriptorSet0.cp_s4)._m0[int(_7)], dm_fa, memory_order_relaxed); }\n')
+ 
+     def test_exact_add_too(self):   # the translator's exact form (XLATE_REDUCED=0): spvFAdd(old, v)
+         src = loop('b', 0, 'v', 10).replace('_11 + v;', 'spvFAdd(_11, v);')
+-        self.assertEqual(float_add_msl(src), '    atomic_fetch_add_explicit((device atomic_float*)&b._m0[0], v, memory_order_relaxed);\n')
++        self.assertEqual(float_add_msl(src), '    { float dm_fa = v; if (dm_fa != 0.0f) atomic_fetch_add_explicit((device atomic_float*)&b._m0[0], dm_fa, memory_order_relaxed); }\n')
+ 
+     def test_other_words_and_shapes_left_alone(self):
+         other = loop('b', 0, 'v', 10).replace('&b._m0[0], &', '&b._m0[1], &')   # the swap on another word than the read
+diff --git a/dm/gfx/tools/dmsh_rewrite.py b/dm/gfx/tools/dmsh_rewrite.py
+index 8247d6c5..0f66d4e7 100644
+--- a/dm/gfx/tools/dmsh_rewrite.py
++++ b/dm/gfx/tools/dmsh_rewrite.py
+@@ -109,6 +109,11 @@ def tg_fence(src):
+ # (an add through the memory pool table, a bounded buffer's guarded swap, shared memory, an ATOM whose result is used) stays a loop, which is correct and only slower. test_dmsh_ampere_alu.py FloatRed checks that
+ # the translator's loop still has this shape
+ # The add is `old + v`, or spvFAdd(old, v) where the translator marks it exact (XLATE_REDUCED=0): one atomic add has nothing to contract, so both become the native add.
++# The add runs only for a value that is not zero (dm_fa != 0.0f: a NaN still adds; a skipped zero changes nothing but the sign of a -0.0 sum). A workaround for Apple's GPU
++# compiler on an M5 (AGXMetalG17G, macOS 26.6.2), whose cause is in that compiler: Ocarina of Time's 278f48371bcf0d58 (AglShader, an add of a selected 0.0 / 1.0), with the bare
++# add, failed its compute pipeline with XPC_ERROR_CONNECTION_INTERRUPTED whenever no border code followed the samples (dm_border_off true, or the corrections taken out by hand),
++# at -O1 and -O2 and not at -O0, so the host skipped its dispatches. The compare-and-swap loop builds, and so does the guarded add: all 11 compute kernels of the game's 33
++# shaders with such adds build with it, with the border constant either way (the 22 others are draw stages, not built alone). Open: not reduced to a compiler bug report
+ FLOAT_ADD = re.compile(r'(?m)^(?P<ind> *)bool (?P<again>_\d+);\n(?P=ind)do\n(?P=ind)\{\n'
+                        r'(?P=ind)    float (?P<old>_\d+) = as_type<float>\((?P<addr>[^\n]*?)\);\n'
+                        r'(?P=ind)    float (?P<sum>_\d+) = (?:(?P=old) \+ (?P<val>[^;\n]+)|spvFAdd\((?P=old), (?P<valp>[^;\n]+)\));\n'
+@@ -119,7 +124,7 @@ FLOAT_ADD = re.compile(r'(?m)^(?P<ind> *)bool (?P<again>_\d+);\n(?P=ind)do\n(?P=
+ def float_add_msl(msl):
+     if 'atomic_compare_exchange_weak_explicit' not in msl: return msl
+     return FLOAT_ADD.sub(lambda m: m.group(0) if m.group('addr') != m.group('addr2') else
+-                         f"{m.group('ind')}atomic_fetch_add_explicit((device atomic_float*)&{m.group('addr')}, {m.group('val') or m.group('valp')}, memory_order_relaxed);\n", msl)
++                         f"{m.group('ind')}{{ float dm_fa = {m.group('val') or m.group('valp')}; if (dm_fa != 0.0f) atomic_fetch_add_explicit((device atomic_float*)&{m.group('addr')}, dm_fa, memory_order_relaxed); }}\n", msl)
+ 
+ # spirv-cross writes OpUMulExtended / OpSMulExtended as calls of an optnone template, spvMulExtended, as Metal's compiler may fail on an inlined mulhi (spirv_msl.cpp,
+ # SPVFuncImplMulExtended). The barrier keeps every product a call that is never folded: Switch 2 shaders divide by constants through the high word of a product (Ocarina of Time

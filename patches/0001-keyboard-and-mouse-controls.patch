@@ -1,0 +1,687 @@
+diff --git a/dm/host/front_mac.m b/dm/host/front_mac.m
+index 3a9ff070..d9afe61f 100644
+--- a/dm/host/front_mac.m
++++ b/dm/host/front_mac.m
+@@ -5,7 +5,9 @@
+ // Cheats (hle_cheats.c): the Cheats menu's rows toggle, reload (⌘R) and open the cheats folder; its first item "Show Cheats
+ // Window" (⌘⇧C, or DM_CHEATS_WINDOW=1 at launch) opens a Cheats panel beside the game: sections, search, the master switch,
+ // safe mode, values, details and the import of cheat files (see the code below).
+-// Key map (Nintendo layout): WASD left stick, arrow keys D-pad (with Shift held: the right stick, for the camera), J=A K=B U=X I=Y, Q=L E=R, Z=ZL C=ZR, F=press left stick G=press right stick, Return=+ Tab=−, Space=shake the controller.
++// Keyboard and mouse: the bindings of keymap.txt in the game's folder (keymap.h; written with the defaults when missing, read again when the window becomes key after an edit,
++// Controls > Edit / Reload Keymap). With mouse_look on, a click in the picture captures the pointer: its motion is the right stick, its buttons and wheel are inputs as bound,
++// ToggleMouse (the ` key) or ReleaseMouse lets it go (Escape is the game's menu by default); with it off, the left mouse button is the touchscreen.
+ // Controllers: face buttons as on the iPhone, by position (right A, bottom B, top X, left Y) or on a Nintendo pad by its labels (pad_apple.h), shoulders L R, triggers ZL ZR, Menu + Options −, both sticks and their presses.
+ // Each controller is a player of its own (local co-op): the first one connected is player 1, together with the keyboard, the next player 2, and so on up to 8 (pad_slots.h);
+ // DM_PAD_MERGE=1 merges every controller into player 1 instead, DM_KBD_PLAYER=own makes the keyboard player 1 on its own, with the controllers from player 2 on.
+@@ -32,14 +34,17 @@
+ #include "home_quit.h"
+ #include "home_quit_mac.h"
+ #include "ctrl_prompt.h"
++#include "keymap.h"
+ #include <signal.h>
+ #include <math.h>
+ #include <sys/stat.h>
+ 
+ static CAMetalLayer *g_layer;
+-static uint64_t g_btn;
+-static int g_w, g_a, g_s, g_d;
+-static int g_rl, g_ru, g_rr, g_rd;   // arrow keys pressed with Shift held: the right stick (each goes back up as it went down, whatever Shift does meanwhile)
++static keymap g_km;                    // the keyboard and mouse bindings (keymap.h), from keymap.txt (keymap_load)
++static uint8_t g_in_down[KM_INPUTS];   // main thread: the keys and mouse buttons held now
++static int g_mcap;                     // main thread: the pointer is captured for mouse look (mouse_capture)
++static double g_mdx, g_mdy;            // main thread: captured mouse motion since the last mouse_tick, in points
++static float g_mrx, g_mry;             // the right stick the captured mouse gives, -1 .. 1
+ static int g_input_on = 1;   // main thread: the game window is key, so its keyboard, mouse and controllers reach the game (input_release / input_resume)
+ 
+ void *front_metal_layer(void) { return (__bridge void *)g_layer; }
+@@ -142,20 +147,18 @@ static void cursor_hide_for_input(void) {
+     NSView *v = g_win.contentView;
+     if (NSPointInRect([v convertPoint:g_win.mouseLocationOutsideOfEventStream fromView:nil], v.bounds)) [NSCursor setHiddenUntilMouseMoves:YES];
+ }
++// The keyboard and mouse as player 1's controller: the actions of every held input (keymap.h), the sticks from their directions (a diagonal on the stick's circle,
++// Walk tilting the left one walk_speed), the captured mouse added to the right one
+ static void push(void) {
+-    int32_t lx = (g_d - g_a) * 32767, ly = (g_w - g_s) * 32767;
+-    int32_t rx = (g_rr - g_rl) * 32767, ry = (g_ru - g_rd) * 32767;
+-    dm_input_set(g_btn, lx, ly, rx, ry);
+-}
+-static int key_bit(unsigned short code) {
+-    switch (code) {
+-        case 38: return 0;  case 40: return 1;  case 32: return 2;  case 34: return 3;    // J K U I → A B X Y
+-        case 3: return 4;   case 5: return 5;                                            // F G → press stick
+-        case 12: return 6;  case 14: return 7;  case 6: return 8;   case 8: return 9;    // Q E Z C → L R ZL ZR
+-        case 36: return 10; case 48: return 11;                                          // Return Tab → + −
+-        case 123: return 12; case 126: return 13; case 124: return 14; case 125: return 15; // ← ↑ → ↓
+-    }
+-    return -1;
++    uint64_t act = 0;
++    for (int i = 0; i < KM_INPUTS; i++) if (g_in_down[i]) act |= g_km.in[i];
++    uint64_t btn = (act & KM_BUTTON_MASK) | (act & KM_BIT(KM_SHAKE) ? DM_BTN_SHAKE : 0);
++    float lx = (float)!!(act & KM_BIT(KM_LRIGHT)) - !!(act & KM_BIT(KM_LLEFT)), ly = (float)!!(act & KM_BIT(KM_LUP)) - !!(act & KM_BIT(KM_LDOWN));
++    if (lx && ly) { lx *= (float)M_SQRT1_2; ly *= (float)M_SQRT1_2; }
++    if (act & KM_BIT(KM_WALK)) { lx *= g_km.walk_speed; ly *= g_km.walk_speed; }
++    float rx = (float)!!(act & KM_BIT(KM_RRIGHT)) - !!(act & KM_BIT(KM_RLEFT)) + g_mrx, ry = (float)!!(act & KM_BIT(KM_RUP)) - !!(act & KM_BIT(KM_RDOWN)) + g_mry;
++    rx = fmaxf(-1.f, fminf(1.f, rx)); ry = fmaxf(-1.f, fminf(1.f, ry));
++    dm_input_set(btn, (int32_t)lroundf(lx * DM_STICK_MAX), (int32_t)lroundf(ly * DM_STICK_MAX), (int32_t)lroundf(rx * DM_STICK_MAX), (int32_t)lroundf(ry * DM_STICK_MAX));
+ }
+ // fn held with a letter: the arrow and function keys carry the same modifier flag, so the key must be a letter for this to be a Globe shortcut
+ static int fn_shortcut(NSEvent *e) {
+@@ -164,24 +167,109 @@ static int fn_shortcut(NSEvent *e) {
+ }
+ static ctrl_prompt g_cp; static int g_cp_confirm, g_cp_cancel;   // the controller applet's prompt (front_ctrl_support) and a key pressed in it since its last step
+ static int cp_poll(void);
+-static void on_key(NSEvent *e, int down) {
+-    if (!g_input_on) return;
+-    unsigned short c = e.keyCode;
+-    if (cp_blocks_input(g_cp.phase)) {   // the prompt has the keyboard: Return or J (A) is done, Escape or K (B) closes it, no key reaches the game
+-        if (down && g_cp.phase == CP_OPEN) { if (c == 53 || c == 40) g_cp_cancel = 1; else if (c == 36 || c == 38) g_cp_confirm = 1; cp_poll(); }
++static void mouse_capture(int on);
++// A key, a modifier or a captured mouse button went down or up (code: keymap.h's inputs)
++static void on_input(int code, int down) {
++    if (!g_input_on || code < 0 || code >= KM_INPUTS) return;
++    if (cp_blocks_input(g_cp.phase)) {   // the prompt has the keyboard: Return or a key bound to A is done, Escape or one bound to B closes it, no key reaches the game
++        if (down && g_cp.phase == CP_OPEN) {
++            if (code == 53 || (g_km.in[code] & KM_BIT(KM_B))) g_cp_cancel = 1; else if (code == 36 || (g_km.in[code] & KM_BIT(KM_A))) g_cp_confirm = 1;
++            cp_poll();
++        }
+         return;
+     }
+-    switch (c) { case 13: g_w = down; break; case 0: g_a = down; break; case 1: g_s = down; break; case 2: g_d = down; break; }
+-    // An arrow key pressed with Shift held is the right stick until it is released; without Shift, the D-pad. The keyboard had no right stick: a 3D game's camera
+-    // could be turned only with a controller (Donkey Kong Bananza)
+-    int *rs = c == 123 ? &g_rl : c == 126 ? &g_ru : c == 124 ? &g_rr : c == 125 ? &g_rd : NULL;
+-    if (rs && (down ? (e.modifierFlags & NSEventModifierFlagShift) != 0 : *rs)) { *rs = down; push(); return; }
+-    int b = key_bit(c);
+-    uint64_t m = b >= 0 ? 1ull << b : c == 49 ? DM_BTN_SHAKE : 0;   // Space: shaken while held
+-    g_btn = down ? (g_btn | m) : (g_btn & ~m);
+-    if (down && (m || c == 13 || c == 0 || c == 1 || c == 2)) cursor_hide_for_input();   // a key the game takes (WASD: the left stick)
++    if (g_in_down[code] == !!down) return;
++    g_in_down[code] = !!down;
++    uint64_t a = g_km.in[code];
++    if (down && (a & KM_BIT(KM_RELEASE_MOUSE))) mouse_capture(0);
++    else if (down && (a & KM_BIT(KM_TOGGLE_MOUSE))) mouse_capture(!g_mcap);
++    if (down && a && code < KM_MOUSE_LEFT) cursor_hide_for_input();   // a key the game takes
++    push();
++}
++static void on_key(NSEvent *e, int down) { on_input(e.keyCode, down); }
++// Nothing stays pressed: the window lost the focus, a prompt or the text box took the input
++static void keys_release(void) {
++    mouse_capture(0);
++    memset(g_in_down, 0, sizeof g_in_down); g_mrx = g_mry = 0; g_mdx = g_mdy = 0;
+     push();
+ }
++// Mouse look: the pointer captured (hidden and held in place, CGAssociateMouseAndMouseCursorPosition) turns the right stick. A stick is a rate, so the motion of each
++// 1/120 s is a deflection: 6 points a tick (720 points a second) is the whole stick at sensitivity 1, eased over about two ticks so the camera does not step at the tick rate
++static NSTimer *g_mtimer;
++static void mouse_tick(void) {
++    float k = g_km.mouse_sensitivity / 6.f;
++    float tx = fmaxf(-1.f, fminf(1.f, (float)g_mdx * k)), ty = fmaxf(-1.f, fminf(1.f, (float)-g_mdy * k * (g_km.mouse_invert_y ? -1.f : 1.f)));   // AppKit's deltaY grows downward
++    g_mdx = g_mdy = 0;
++    float nx = .5f * g_mrx + .5f * tx, ny = .5f * g_mry + .5f * ty;
++    if (fabsf(nx) < .01f) nx = 0;
++    if (fabsf(ny) < .01f) ny = 0;
++    if (nx != g_mrx || ny != g_mry) { g_mrx = nx; g_mry = ny; push(); }
++}
++static void mouse_capture(int on) {
++    on = !!on;
++    if (on && (!g_km.mouse_look || !g_input_on || g_text_box || !g_win.isKeyWindow)) return;
++    if (on == g_mcap) return;
++    g_mcap = on;
++    if (on) {
++        CGAssociateMouseAndMouseCursorPosition(false); [NSCursor hide];
++        g_mdx = g_mdy = 0;
++        g_mtimer = [NSTimer timerWithTimeInterval:1.0 / 120 repeats:YES block:^(NSTimer *t) { (void)t; mouse_tick(); }];
++        [NSRunLoop.mainRunLoop addTimer:g_mtimer forMode:NSRunLoopCommonModes];
++        char rel[128], tog[128]; km_keys_of(&g_km, KM_RELEASE_MOUSE, rel, sizeof rel); km_keys_of(&g_km, KM_TOGGLE_MOUSE, tog, sizeof tog);
++        LOG("front end: mouse captured: it turns the camera and its buttons are as keymap.txt binds them (ToggleMouse %s or ReleaseMouse %s lets it go)", tog, rel);
++    } else {
++        CGAssociateMouseAndMouseCursorPosition(true); [NSCursor unhide];
++        [g_mtimer invalidate]; g_mtimer = nil;
++        for (int i = KM_MOUSE_LEFT; i < KM_INPUTS; i++) g_in_down[i] = 0;
++        g_mrx = g_mry = 0; g_mdx = g_mdy = 0;
++        push();
++        LOG("front end: mouse released");
++    }
++}
++// keymap.txt (keymap.h): DM_KEYMAP, else the game's folder (DM_ROOT: the app's Application Support folder). Written with the defaults when there is none; read again
++// when the window becomes key and the file changed since (an edit made while the game runs; only_if_changed) and from Controls > Reload Keymap. Lines it cannot take
++// change nothing and are shown in a sheet on the window
++static char g_km_path[1024]; static struct timespec g_km_mtime; static int g_km_read;
++static const char *keymap_path(void) {
++    if (!*g_km_path) {
++        const char *p = getenv("DM_KEYMAP"), *r = getenv("DM_ROOT");
++        if (p && *p) snprintf(g_km_path, sizeof g_km_path, "%s", p);
++        else snprintf(g_km_path, sizeof g_km_path, "%s%skeymap.txt", r && *r ? r : "", r && *r ? "/" : "");
++    }
++    return g_km_path;
++}
++static void keymap_load(int only_if_changed) {
++    const char *path = keymap_path(); struct stat st;
++    if (stat(path, &st)) {
++        FILE *f = fopen(path, "w");
++        if (f) { fputs(KM_DEFAULT_FILE, f); fclose(f); LOG("front end: keymap %s written with the default controls", path); }
++        if (stat(path, &st)) { if (!g_km_read) { km_defaults(&g_km); g_km_read = 1; } LOG("front end: keymap %s cannot be written: the default controls", path); return; }
++    }
++    if (only_if_changed && g_km_read && st.st_mtimespec.tv_sec == g_km_mtime.tv_sec && st.st_mtimespec.tv_nsec == g_km_mtime.tv_nsec) return;
++    g_km_mtime = st.st_mtimespec;
++    NSString *text = [NSString stringWithContentsOfFile:@(path) encoding:NSUTF8StringEncoding error:nil];
++    keymap k; km_defaults(&k); char err[2048] = "";
++    int bad = text ? km_parse(&k, text.UTF8String, err, sizeof err) : -1;
++    if (bad < 0) { LOG("front end: keymap %s is not readable UTF-8 text: the default controls", path); bad = 0; }
++    keys_release();
++    g_km = k; g_km_read = 1;
++    char a[128], b[128], ml[128]; km_keys_of(&k, KM_A, a, sizeof a); km_keys_of(&k, KM_B, b, sizeof b); km_keys_of(&k, KM_RELEASE_MOUSE, ml, sizeof ml);
++    LOG("front end: keymap %s: A = %s, B = %s; mouse look %s (sensitivity %.2f, %s releases it)%s", path, a, b, k.mouse_look ? "on" : "off", k.mouse_sensitivity, ml,
++        bad ? "; some lines were not taken:" : "");
++    if (!bad) return;
++    for (char *s = err, *e; *s; s = e + 1) { e = strchr(s, '\n'); if (!e) { LOG("front end: keymap %s", s); break; } *e = 0; LOG("front end: keymap %s", s); }
++    if (!g_win) return;
++    NSAlert *al = [NSAlert new];
++    al.messageText = @"Some keymap lines were not taken";
++    al.informativeText = [NSString stringWithFormat:@"%s\n\nThose lines were left out: their actions keep the default keys. Fix them in keymap.txt (Controls > Edit Keymap) and switch back to the game.", err];
++    [al beginSheetModalForWindow:g_win completionHandler:nil];
++}
++@interface DmControlsMenu : NSObject @end
++@implementation DmControlsMenu
++- (void)editKeymap:(id)sender { (void)sender; keymap_load(1); [NSWorkspace.sharedWorkspace openURL:[NSURL fileURLWithPath:@(keymap_path())]]; }
++- (void)reloadKeymap:(id)sender { (void)sender; keymap_load(0); }
++- (void)releaseMouse:(id)sender { (void)sender; mouse_capture(0); }
++@end
+ 
+ // Physical controllers (GameController) go to dm_pad_set_player, mapped as the iPhone's (DmGamepad.m read_pad, same layout); player 1's is ORed with the keyboard, a stick takes
+ // whichever is deflected more (hle_hid.c). DM_KEYS uses player 1's path, so player 1's controller touched during a script takes it over.
+@@ -347,7 +435,7 @@ static void input_release(void) {
+     g_input_on = 0;
+     dm_motion_pro_active(0); hidpad_motion_clear();
+     dm_switch2_active(0); dm_jc1_active(0);
+-    g_btn = 0; g_w = g_a = g_s = g_d = 0; g_rl = g_ru = g_rr = g_rd = 0; push();
++    keys_release();
+     if (g_mouse_down) { g_mouse_down = 0; dm_touch_set(NULL, 0); }
+     pads_release();
+ }
+@@ -357,6 +445,7 @@ static void input_resume(void) {
+     dm_motion_pro_active(1);
+     dm_switch2_active(1); dm_jc1_active(1);
+     pads_reread();
++    keymap_load(1);   // keymap.txt edited while the game was in the background
+ }
+ // Raw HID gamepads (pad_hid_mac.h): a player slot each, as a GameController controller, named by the device's product name. Identical pads that GameController lists
+ // fewer of are read the same way, an identical Pro Controller from its report 0x30.
+@@ -635,7 +724,7 @@ int front_ctrl_support(int min, int max) {
+     if (!g_layer) return -1;
+     dispatch_semaphore_t done = dispatch_semaphore_create(0);
+     dispatch_async(dispatch_get_main_queue(), ^{
+-        g_btn = 0; g_w = g_a = g_s = g_d = 0; g_rl = g_ru = g_rr = g_rd = 0; push();   // nothing the game held stays pressed while the prompt has the input
++        keys_release();   // nothing the game held stays pressed while the prompt has the input
+         if (g_mouse_down) { g_mouse_down = 0; dm_touch_set(NULL, 0); }
+         pads_release();
+         int a, b; cp_buttons(&a, &b);
+@@ -674,7 +763,7 @@ @interface DmGameView : NSView @end
+ @implementation DmGameView
+ - (void)mouseDown:(NSEvent *)e { [self mouseDragged:e]; }
+ - (void)mouseDragged:(NSEvent *)e {
+-    if (!g_input_on) return;
++    if (!g_input_on || g_km.mouse_look) return;   // with mouse look the mouse is no touchscreen: a click that could not capture it (the window was not key yet) touches nothing
+     NSPoint p = [self convertPoint:e.locationInWindow fromView:nil]; NSSize b = self.bounds.size;
+     double w = b.width, h = b.height;
+     if (w <= 0 || h <= 0) return;
+@@ -1587,6 +1676,8 @@ void front_run(void (*guest)(void)) {
+         [win makeKeyAndOrderFront:nil];
+         screen_refresh(win.screen ?: NSScreen.mainScreen);
+         g_win = win;
++        win.acceptsMouseMovedEvents = YES;   // the captured mouse's motion (mouse look)
++        keymap_load(0);
+         [NSApp activateIgnoringOtherApps:YES];
+         // A host another process starts (scripts/regress.py) is not activated (its focus state stays 2), so its window opened wherever it landed in the window order, and behind
+         // another app's window macOS fires its display link about once a second: Breath of the Wild stepped up to 3 vsyncs at boot and never came back (20 fps runs).
+@@ -1611,6 +1702,14 @@ void front_run(void (*guest)(void)) {
+         [[bar addItemWithTitle:@"Cheats" action:nil keyEquivalent:@""] setSubmenu:cm];
+         if (getenv("DM_CHEATS_WINDOW") && atoi(getenv("DM_CHEATS_WINDOW")))   // the Cheats panel open from the start (beside the game, not key)
+             dispatch_async(dispatch_get_main_queue(), ^{ [g_cheats_menu showPanel:nil]; });
++        // Controls: the keymap file (keymap.h) opened in the player's text editor, read again, and the captured mouse let go
++        static DmControlsMenu *ctl; ctl = [DmControlsMenu new];
++        NSMenu *km = [[NSMenu alloc] initWithTitle:@"Controls"];
++        [km addItemWithTitle:@"Edit Keymap…" action:@selector(editKeymap:) keyEquivalent:@"k"].target = ctl;
++        NSMenuItem *rk = [km addItemWithTitle:@"Reload Keymap" action:@selector(reloadKeymap:) keyEquivalent:@"k"];
++        rk.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagShift; rk.target = ctl;
++        [km addItemWithTitle:@"Release Mouse" action:@selector(releaseMouse:) keyEquivalent:@""].target = ctl;
++        [[bar addItemWithTitle:@"Controls" action:nil keyEquivalent:@""] setSubmenu:km];
+         [[bar addItemWithTitle:@"Window" action:nil keyEquivalent:@""] setSubmenu:wm];
+         [wm addItemWithTitle:@"Enter Full Screen" action:@selector(toggleFullScreen:) keyEquivalent:@"f"].keyEquivalentModifierMask = NSEventModifierFlagControl | NSEventModifierFlagCommand;
+         NSApp.mainMenu = bar;
+@@ -1648,13 +1747,53 @@ void front_run(void (*guest)(void)) {
+                 if (conn) hq_log_setting(); }];
+         dm_haptics_apple_init();
+         pads_start();
+-        [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown | NSEventMaskKeyUp handler:^NSEvent *(NSEvent *e) {
++        [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown | NSEventMaskKeyUp | NSEventMaskFlagsChanged handler:^NSEvent *(NSEvent *e) {
+             if (e.window != win) return e;   // Only swallow keys for the game window; other windows such as the software keyboard input box receive typing as usual
++            if (e.type == NSEventTypeFlagsChanged) {   // Shift, Control, Option: no key presses, a change of the flags; the device bit says whether this one is down. AppKit still gets it
++                uint64_t f = km_modifier_flag(e.keyCode);
++                if (f) on_input(e.keyCode, (e.modifierFlags & f) != 0);
++                return e;
++            }
+             if (e.type == NSEventTypeKeyDown && (e.modifierFlags & NSEventModifierFlagCommand)) return e;   // ⌘ shortcuts go to the menu; a key released while ⌘ is held still reaches the game, or it would stay pressed
+             if (e.type == NSEventTypeKeyDown && fn_shortcut(e)) return e;   // fn (Globe) + a letter is the system's (fn+F full screen, GitHub issue #873), not the game's F
+             if (!e.isARepeat) on_key(e, e.type == NSEventTypeKeyDown);
+             return nil;   // Swallow it to avoid the system beep
+         }];
++        // The mouse: with mouse look on, a click in the picture (not the title bar or the edges) captures it and does nothing else; captured, its motion is the right stick
++        // (mouse_tick) and its buttons and wheel are inputs (a wheel notch a 100 ms press); not captured, events go on to the view, where the left button is the touchscreen
++        [NSEvent addLocalMonitorForEventsMatchingMask:NSEventMaskMouseMoved | NSEventMaskLeftMouseDragged | NSEventMaskRightMouseDragged | NSEventMaskOtherMouseDragged |
++                                                      NSEventMaskLeftMouseDown | NSEventMaskLeftMouseUp | NSEventMaskRightMouseDown | NSEventMaskRightMouseUp |
++                                                      NSEventMaskOtherMouseDown | NSEventMaskOtherMouseUp | NSEventMaskScrollWheel handler:^NSEvent *(NSEvent *e) {
++            if (e.window && e.window != win) return e;
++            if (!g_mcap) {
++                if (e.type == NSEventTypeLeftMouseDown && g_km.mouse_look && g_input_on && !g_text_box && !cp_blocks_input(g_cp.phase) && e.window == win) {
++                    NSView *v = win.contentView;
++                    if (NSPointInRect([v convertPoint:e.locationInWindow fromView:nil], v.bounds)) { mouse_capture(1); if (g_mcap) return nil; }
++                }
++                return e;
++            }
++            switch (e.type) {
++                case NSEventTypeMouseMoved: case NSEventTypeLeftMouseDragged: case NSEventTypeRightMouseDragged: case NSEventTypeOtherMouseDragged:
++                    g_mdx += e.deltaX; g_mdy += e.deltaY; break;
++                case NSEventTypeLeftMouseDown: case NSEventTypeLeftMouseUp: on_input(KM_MOUSE_LEFT, e.type == NSEventTypeLeftMouseDown); break;
++                case NSEventTypeRightMouseDown: case NSEventTypeRightMouseUp: on_input(KM_MOUSE_RIGHT, e.type == NSEventTypeRightMouseDown); break;
++                case NSEventTypeOtherMouseDown: case NSEventTypeOtherMouseUp: {
++                    NSInteger b = e.buttonNumber; int code = b == 2 ? KM_MOUSE_MIDDLE : b == 3 ? KM_MOUSE_4 : b == 4 ? KM_MOUSE_5 : -1;
++                    if (code >= 0) on_input(code, e.type == NSEventTypeOtherMouseDown);
++                    break;
++                }
++                case NSEventTypeScrollWheel: {
++                    if (e.momentumPhase != NSEventPhaseNone || e.scrollingDeltaY == 0) break;   // a trackpad's coasting after the fingers lift is no notch
++                    int code = e.scrollingDeltaY > 0 ? KM_WHEEL_UP : KM_WHEEL_DOWN;
++                    if (g_in_down[code]) break;
++                    on_input(code, 1);
++                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{ on_input(code, 0); });
++                    break;
++                }
++                default: break;
++            }
++            return nil;
++        }];
+         [[NSNotificationCenter defaultCenter] addObserverForName:NSWindowWillCloseNotification object:win queue:nil
+                                                       usingBlock:^(NSNotification *n) { (void)n; exit(0); }];
+         // Lifecycle (hle.h / dm.h): focus lost → 2, focus regained → 1; minimized → 3 + audio paused + GPU suspended, restored → resume (followed by focus regained → 1).
+@@ -1728,7 +1867,7 @@ int front_text_input(const char *title, const char *sub, const char *guide, cons
+     dispatch_sync(dispatch_get_main_queue(), ^{
+         // The box takes the keyboard and the mouse, so the game window never sees the key-up of the button or the touch-up of the click that opened it: nothing may stay pressed
+         // while it is up, or the game reads the stuck button / touch the moment the box closes (Stardew Valley's character creation re-opened the keyboard endlessly)
+-        g_btn = 0; g_w = g_a = g_s = g_d = 0; g_rl = g_ru = g_rr = g_rd = 0; push();
++        keys_release();
+         dm_touch_set(NULL, 0);
+         int min_chars = g_swkbd_min_chars > 0 ? g_swkbd_min_chars : 0;
+         NSString *info = [NSString stringWithFormat:@"%s%s%s", sub ? sub : "", sub && *sub && guide && *guide ? "\n" : "", guide ? guide : ""];
+diff --git a/dm/host/keymap.h b/dm/host/keymap.h
+new file mode 100644
+index 00000000..e01b0369
+--- /dev/null
++++ b/dm/host/keymap.h
+@@ -0,0 +1,235 @@
++// The Mac front end's keyboard and mouse bindings (front_mac.m): a text file the player edits, keymap.txt in the game's folder (DM_ROOT, the app's
++// ~/Library/Application Support/nxnative/<title ID>/; DM_KEYMAP=<path> names another). Each line binds a Switch input (button, stick direction) or a host
++// action to keys and mouse buttons: "A = E, Return". A line replaces that action's defaults; "none" unbinds it. The defaults are KM_DEFAULT_FILE itself,
++// parsed: the file written for the player and the bindings without a file are the same by construction (tests/t_keymap.c).
++// Keys are macOS virtual key codes, so a name is a position on a US layout keyboard whatever the layout in use. The Command keys stay with macOS.
++// Header-only, as home_quit.h and ctrl_prompt.h: pure C, so the parser is tested without AppKit
++#pragma once
++#include <ctype.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++// Actions. 0..15 are the controller buttons in dm_input.h's bit order (DM_BTN_A = 1 << 0 … DM_BTN_DOWN = 1 << 15)
++enum {
++    KM_A, KM_B, KM_X, KM_Y, KM_LS, KM_RS, KM_L, KM_R, KM_ZL, KM_ZR, KM_PLUS, KM_MINUS, KM_DLEFT, KM_DUP, KM_DRIGHT, KM_DDOWN,
++    KM_SHAKE,                                    // the controller shaken while held (DM_BTN_SHAKE)
++    KM_LUP, KM_LDOWN, KM_LLEFT, KM_LRIGHT,       // left stick
++    KM_RUP, KM_RDOWN, KM_RLEFT, KM_RRIGHT,       // right stick
++    KM_WALK,                                     // the left stick tilts only walk_speed while held
++    KM_RELEASE_MOUSE, KM_TOGGLE_MOUSE,           // mouse look: let go of the pointer / take it or let it go
++    KM_ACTIONS
++};
++#define KM_BIT(a) (1ull << (a))
++#define KM_BUTTON_MASK 0xffffull                 // the actions that are controller buttons
++
++// Inputs: 0..127 macOS virtual key codes, then the mouse
++enum { KM_MOUSE_LEFT = 128, KM_MOUSE_RIGHT, KM_MOUSE_MIDDLE, KM_MOUSE_4, KM_MOUSE_5, KM_WHEEL_UP, KM_WHEEL_DOWN, KM_INPUTS };
++
++typedef struct {
++    uint64_t in[KM_INPUTS];   // the actions each input does
++    int mouse_look;           // a click in the game window captures the pointer: its motion is the right stick, its buttons as bound
++    int mouse_invert_y;
++    float mouse_sensitivity;  // 0.1 .. 10
++    float walk_speed;         // 0.1 .. 1
++} keymap;
++
++static const struct { const char *name; int action; } KM_ACTION_NAMES[] = {
++    {"A", KM_A}, {"B", KM_B}, {"X", KM_X}, {"Y", KM_Y}, {"LStickPress", KM_LS}, {"RStickPress", KM_RS}, {"L", KM_L}, {"R", KM_R},
++    {"ZL", KM_ZL}, {"ZR", KM_ZR}, {"Plus", KM_PLUS}, {"Minus", KM_MINUS}, {"DLeft", KM_DLEFT}, {"DUp", KM_DUP}, {"DRight", KM_DRIGHT}, {"DDown", KM_DDOWN},
++    {"Shake", KM_SHAKE}, {"LUp", KM_LUP}, {"LDown", KM_LDOWN}, {"LLeft", KM_LLEFT}, {"LRight", KM_LRIGHT},
++    {"RUp", KM_RUP}, {"RDown", KM_RDOWN}, {"RLeft", KM_RLEFT}, {"RRight", KM_RRIGHT}, {"Walk", KM_WALK},
++    {"ReleaseMouse", KM_RELEASE_MOUSE}, {"ToggleMouse", KM_TOGGLE_MOUSE},
++};
++
++// Key names (kVK_* of Carbon's Events.h). Command (54, 55), Function (63) and Caps Lock (57) are not bindable: macOS keeps them
++static const struct { const char *name; int code; } KM_KEY_NAMES[] = {
++    {"A", 0}, {"S", 1}, {"D", 2}, {"F", 3}, {"H", 4}, {"G", 5}, {"Z", 6}, {"X", 7}, {"C", 8}, {"V", 9}, {"B", 11}, {"Q", 12}, {"W", 13}, {"E", 14},
++    {"R", 15}, {"Y", 16}, {"T", 17}, {"1", 18}, {"2", 19}, {"3", 20}, {"4", 21}, {"6", 22}, {"5", 23}, {"Equal", 24}, {"9", 25}, {"7", 26},
++    {"Minus", 27}, {"8", 28}, {"0", 29}, {"RightBracket", 30}, {"O", 31}, {"U", 32}, {"LeftBracket", 33}, {"I", 34}, {"P", 35}, {"Return", 36},
++    {"L", 37}, {"J", 38}, {"Quote", 39}, {"K", 40}, {"Semicolon", 41}, {"Backslash", 42}, {"Comma", 43}, {"Slash", 44}, {"N", 45}, {"M", 46},
++    {"Period", 47}, {"Tab", 48}, {"Space", 49}, {"Grave", 50}, {"Backspace", 51}, {"Escape", 53},
++    {"LShift", 56}, {"LOption", 58}, {"LControl", 59}, {"RShift", 60}, {"ROption", 61}, {"RControl", 62},
++    {"KeypadDecimal", 65}, {"KeypadMultiply", 67}, {"KeypadPlus", 69}, {"KeypadDivide", 75}, {"KeypadEnter", 76}, {"KeypadMinus", 78},
++    {"KeypadEquals", 81}, {"Keypad0", 82}, {"Keypad1", 83}, {"Keypad2", 84}, {"Keypad3", 85}, {"Keypad4", 86}, {"Keypad5", 87}, {"Keypad6", 88},
++    {"Keypad7", 89}, {"Keypad8", 91}, {"Keypad9", 92},
++    {"F1", 122}, {"F2", 120}, {"F3", 99}, {"F4", 118}, {"F5", 96}, {"F6", 97}, {"F7", 98}, {"F8", 100}, {"F9", 101}, {"F10", 109}, {"F11", 103},
++    {"F12", 111}, {"F13", 105}, {"F14", 107}, {"F15", 113},
++    {"Home", 115}, {"PageUp", 116}, {"Delete", 117}, {"End", 119}, {"PageDown", 121}, {"Left", 123}, {"Right", 124}, {"Down", 125}, {"Up", 126},
++    {"MouseLeft", KM_MOUSE_LEFT}, {"MouseRight", KM_MOUSE_RIGHT}, {"MouseMiddle", KM_MOUSE_MIDDLE}, {"Mouse4", KM_MOUSE_4}, {"Mouse5", KM_MOUSE_5},
++    {"WheelUp", KM_WHEEL_UP}, {"WheelDown", KM_WHEEL_DOWN},
++    // other spellings
++    {"Enter", 36}, {"Esc", 53}, {"Shift", 56}, {"Control", 59}, {"Ctrl", 59}, {"LCtrl", 59}, {"RCtrl", 62}, {"Option", 58}, {"Alt", 58}, {"LAlt", 58},
++    {"RAlt", 61}, {"Backtick", 50}, {"Tilde", 50}, {"ArrowUp", 126}, {"ArrowDown", 125}, {"ArrowLeft", 123}, {"ArrowRight", 124},
++};
++
++// The modifier keys arrive as flag changes, not key presses: the device-dependent bit of NSEvent.modifierFlags (IOKit's NX_DEVICE*KEYMASK) that says whether that one is down
++static inline uint64_t km_modifier_flag(int code) {
++    switch (code) {
++        case 56: return 0x02; case 60: return 0x04;      // left / right Shift
++        case 59: return 0x01; case 62: return 0x2000;    // left / right Control
++        case 58: return 0x20; case 61: return 0x40;      // left / right Option
++    }
++    return 0;
++}
++
++static inline int km_streq(const char *a, const char *b) {   // case-insensitive
++    for (; *a && *b; a++, b++) if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) return 0;
++    return !*a && !*b;
++}
++static inline int km_action_id(const char *name) {
++    for (size_t i = 0; i < sizeof KM_ACTION_NAMES / sizeof *KM_ACTION_NAMES; i++) if (km_streq(name, KM_ACTION_NAMES[i].name)) return KM_ACTION_NAMES[i].action;
++    return -1;
++}
++static inline const char *km_action_name(int a) {
++    for (size_t i = 0; i < sizeof KM_ACTION_NAMES / sizeof *KM_ACTION_NAMES; i++) if (KM_ACTION_NAMES[i].action == a) return KM_ACTION_NAMES[i].name;
++    return "?";
++}
++static inline int km_input_code(const char *name) {
++    for (size_t i = 0; i < sizeof KM_KEY_NAMES / sizeof *KM_KEY_NAMES; i++) if (km_streq(name, KM_KEY_NAMES[i].name)) return KM_KEY_NAMES[i].code;
++    return -1;
++}
++static inline const char *km_input_name(int code) {   // the first (canonical) name
++    for (size_t i = 0; i < sizeof KM_KEY_NAMES / sizeof *KM_KEY_NAMES; i++) if (KM_KEY_NAMES[i].code == code) return KM_KEY_NAMES[i].name;
++    return "?";
++}
++
++// The file written for the player when there is none: its bindings are the defaults (km_defaults parses it)
++static const char KM_DEFAULT_FILE[] =
++"# Keyboard and mouse controls (nxnative). Edit and save this file with any text editor: the game reads it\n"
++"# again when its window becomes active (or Controls > Reload Keymap). Delete it to get these defaults back.\n"
++"#\n"
++"# The layout is MacNativeGames' Breath of the Wild / Tears of the Kingdom one (left hand on W A S D, right\n"
++"# hand on the mouse), moved where Ocarina of Time's buttons differ: this game sprints on a held A, not B,\n"
++"# so Shift presses A here (in a menu Shift confirms, like E).\n"
++"#\n"
++"# Each line:  Action = Key   or   Action = Key1, Key2   or   Action = none\n"
++"# A line replaces that action's defaults; a key may do several actions. Text after # is a note.\n"
++"# The left side is a Switch button: the game's on-screen prompts name them (A, B, X, Y, ZL ...).\n"
++"\n"
++"# ---- Mouse ----\n"
++"# mouse_look = on: click in the game window to capture the mouse; moving it turns the camera and its\n"
++"#   buttons do what they are bound to below. The ` key (or switching apps) lets it go.\n"
++"# mouse_look = off: the mouse is the Switch's touchscreen (click = touch).\n"
++"mouse_look = on\n"
++"mouse_sensitivity = 1.0      # 0.1 (slow) to 10 (fast)\n"
++"mouse_invert_y = off\n"
++"walk_speed = 0.5             # how far the left stick tilts while Walk is held, 0.1 to 1\n"
++"\n"
++"# ---- Moving and camera ----\n"
++"LUp = W\n"
++"LDown = S\n"
++"LLeft = A\n"
++"LRight = D\n"
++"RUp = Up                     # the arrow keys turn the camera too (the captured mouse does)\n"
++"RDown = Down\n"
++"RLeft = Left\n"
++"RRight = Right\n"
++"Walk = LControl              # hold to walk slowly (narrow ledges)\n"
++"\n"
++"# ---- Field ----\n"
++"A = E, Return, LShift        # talk, open, pick up, climb; hold Shift (or E) while moving to sprint\n"
++"B = Backspace, X             # put away; back out of a menu\n"
++"X = Space                    # jump\n"
++"Y = MouseLeft, G             # sword\n"
++"ZL = Q, MouseMiddle          # target (lock on), shield\n"
++"ZR = MouseRight, LOption     # use the equipped item (slingshot, bow, hookshot ...)\n"
++"L = F                        # item quick select\n"
++"R = R                        # item quick select\n"
++"DLeft = 2, O                 # ocarina\n"
++"DUp = 3\n"
++"DRight = 4, N                # talk to Navi\n"
++"DDown = 5\n"
++"LStickPress = C\n"
++"RStickPress = V              # camera reset\n"
++"Plus = Escape, I             # the game's menu (items, equipment, quest)\n"
++"Minus = Tab, M               # map\n"
++"Shake = H                    # shakes the controller while held (motion controls)\n"
++"\n"
++"# ---- Mouse capture ----\n"
++"ToggleMouse = Grave          # the ` key: let the mouse go, or take it back without clicking\n"
++"ReleaseMouse = none          # a key that only lets it go\n"
++"\n"
++"# ---- Names you can use ----\n"
++"# Letters A-Z, digits 0-9, F1-F15, Space, Return, Tab, Escape, Backspace, Delete, Up, Down, Left, Right,\n"
++"# Home, End, PageUp, PageDown, LShift, RShift, LControl, RControl, LOption, ROption,\n"
++"# Minus, Equal, LeftBracket, RightBracket, Semicolon, Quote, Comma, Period, Slash, Backslash, Grave,\n"
++"# Keypad0-Keypad9, KeypadPlus, KeypadMinus, KeypadMultiply, KeypadDivide, KeypadDecimal, KeypadEnter, KeypadEquals,\n"
++"# and while the mouse is captured: MouseLeft, MouseRight, MouseMiddle, Mouse4, Mouse5, WheelUp, WheelDown.\n"
++"# Keys are by position on a US keyboard. The Command keys stay with macOS (Command-Q quits).\n"
++"# Actions: A B X Y L R ZL ZR Plus Minus DUp DDown DLeft DRight LStickPress RStickPress Shake\n"
++"#          LUp LDown LLeft LRight RUp RDown RLeft RRight Walk ReleaseMouse ToggleMouse\n";
++
++static inline void km_clear(keymap *k) { memset(k, 0, sizeof *k); k->mouse_sensitivity = 1.f; k->walk_speed = .5f; }
++
++static inline char *km_trim(char *s) {
++    while (isspace((unsigned char)*s)) s++;
++    char *e = s + strlen(s); while (e > s && isspace((unsigned char)e[-1])) *--e = 0;
++    return s;
++}
++static inline int km_onoff(const char *v) {   // 1, 0, or -1 when neither
++    if (km_streq(v, "on") || km_streq(v, "true") || km_streq(v, "yes") || km_streq(v, "1")) return 1;
++    if (km_streq(v, "off") || km_streq(v, "false") || km_streq(v, "no") || km_streq(v, "0")) return 0;
++    return -1;
++}
++
++// Parses text over k (whatever k holds already stays unless a line changes it). Returns the number of lines it could not take, each described in err
++// ("line N: …", one per line, as many as fit); those lines change nothing
++static inline int km_parse(keymap *k, const char *text, char *err, size_t errlen) {
++    int bad = 0, ln = 0; size_t used = 0; if (err && errlen) *err = 0;
++    #define KM_BAD(...) do { bad++; if (err && used < errlen) { int w = snprintf(err + used, errlen - used, "line %d: ", ln); if (w > 0) used += (size_t)w; \
++        if (used < errlen) { w = snprintf(err + used, errlen - used, __VA_ARGS__); if (w > 0) used += (size_t)w; } if (used < errlen) { err[used++] = '\n'; err[used < errlen ? used : errlen - 1] = 0; } } } while (0)
++    const char *p = text;
++    while (p && *p) {
++        const char *nl = strchr(p, '\n'); size_t n = nl ? (size_t)(nl - p) : strlen(p);
++        char line[512]; ln++;
++        if (n >= sizeof line) { KM_BAD("too long"); p = nl ? nl + 1 : NULL; continue; }
++        memcpy(line, p, n); line[n] = 0; p = nl ? nl + 1 : NULL;
++        char *h = strchr(line, '#'); if (h) *h = 0;
++        char *s = km_trim(line); if (!*s) continue;
++        char *eq = strchr(s, '='); if (!eq) { KM_BAD("no '=' in \"%s\"", s); continue; }
++        *eq = 0; char *name = km_trim(s), *val = km_trim(eq + 1);
++        if (km_streq(name, "mouse_look") || km_streq(name, "mouse_invert_y")) {
++            int v = km_onoff(val); if (v < 0) { KM_BAD("%s takes on or off, not \"%s\"", name, val); continue; }
++            if (km_streq(name, "mouse_look")) k->mouse_look = v; else k->mouse_invert_y = v;
++            continue;
++        }
++        if (km_streq(name, "mouse_sensitivity") || km_streq(name, "walk_speed")) {
++            char *end; float v = strtof(val, &end); int sens = km_streq(name, "mouse_sensitivity");
++            if (end == val || *km_trim(end) || v < (sens ? .1f : .1f) || v > (sens ? 10.f : 1.f)) { KM_BAD("%s takes a number from %s, not \"%s\"", name, sens ? "0.1 to 10" : "0.1 to 1", val); continue; }
++            if (sens) k->mouse_sensitivity = v; else k->walk_speed = v;
++            continue;
++        }
++        int a = km_action_id(name);
++        if (a < 0) { KM_BAD("unknown action \"%s\"", name); continue; }
++        int codes[16], nc = 0, ok = 1;
++        if (!km_streq(val, "none") && *val) {
++            char *q = val;
++            while (q && ok) {
++                char *c = strchr(q, ','); if (c) *c = 0;
++                char *kn = km_trim(q); q = c ? c + 1 : NULL;
++                if (!*kn) continue;
++                int code = km_input_code(kn);
++                if (code < 0) { KM_BAD("unknown key \"%s\" for %s", kn, km_action_name(a)); ok = 0; break; }
++                if (nc < (int)(sizeof codes / sizeof *codes)) codes[nc++] = code;
++            }
++        }
++        if (!ok) continue;
++        for (int i = 0; i < KM_INPUTS; i++) k->in[i] &= ~KM_BIT(a);   // the line replaces the action's keys
++        for (int i = 0; i < nc; i++) k->in[codes[i]] |= KM_BIT(a);
++    }
++    #undef KM_BAD
++    return bad;
++}
++
++static inline void km_defaults(keymap *k) { km_clear(k); km_parse(k, KM_DEFAULT_FILE, NULL, 0); }
++
++// The keys of one action, comma-separated ("E, Return"), or "none"
++static inline void km_keys_of(const keymap *k, int a, char *out, size_t n) {
++    size_t u = 0; if (n) *out = 0;
++    for (int i = 0; i < KM_INPUTS; i++) if (k->in[i] & KM_BIT(a)) {
++        int w = snprintf(out + u, u < n ? n - u : 0, "%s%s", u ? ", " : "", km_input_name(i)); if (w > 0) u += (size_t)w;
++    }
++    if (!u && n) snprintf(out, n, "none");
++}
+diff --git a/dm/host/tests/Makefile b/dm/host/tests/Makefile
+index 46b3346a..4f305bf2 100644
+--- a/dm/host/tests/Makefile
++++ b/dm/host/tests/Makefile
+@@ -71,6 +71,7 @@ run: $(B)/t_mii $(B)/t_net_eventfd $(B)/t_language $(B)/t_motion $(B)/t_heap_siz
+ 	$(B)/t_home_quit
+ 	$(B)/t_home_quit_mac
+ 	$(B)/t_ctrl_prompt
++	$(B)/t_keymap
+ 	$(B)/t_motion_pro
+ 	$(B)/t_motion_pro_mac
+ 	$(B)/t_jc1
+@@ -271,6 +272,9 @@ $(B)/t_home_quit_mac: t_home_quit_mac.m ../home_quit_mac.h | $(B)
+ run: $(B)/t_ctrl_prompt
+ $(B)/t_ctrl_prompt: t_ctrl_prompt.c ../ctrl_prompt.h | $(B)
+ 	$(CLANG) -O1 -g -Wall -Werror -fsanitize=address,undefined -I.. -o $@ t_ctrl_prompt.c
++run: $(B)/t_keymap
++$(B)/t_keymap: t_keymap.c ../keymap.h | $(B)
++	$(CLANG) -O1 -g -Wall -Werror -fsanitize=address,undefined -I.. -o $@ t_keymap.c
+ run: $(B)/t_motion_pro $(B)/t_motion_pro_mac $(B)/t_pad_hid_mac $(B)/t_jc1
+ $(B)/t_jc1: t_jc1.c ../pad_jc1.h ../pad_pro.h ../hle_haptics.h ../dm_input.h | $(B)
+ 	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -fsanitize=address,undefined -I.. -o $@ t_jc1.c
+diff --git a/dm/host/tests/t_keymap.c b/dm/host/tests/t_keymap.c
+new file mode 100644
+index 00000000..10bebcf1
+--- /dev/null
++++ b/dm/host/tests/t_keymap.c
+@@ -0,0 +1,56 @@
++// The keyboard and mouse bindings (keymap.h): the default file parses whole and binds every action, no default key does two things, a line replaces
++// its action's keys, "none" unbinds, unknown names and out-of-range values are reported and change nothing, names are case-insensitive with their
++// other spellings, and the key table names only bindable codes
++#include "../keymap.h"
++#include <stdio.h>
++
++static int checks, fails;
++#define CHECK(c, msg) do { checks++; if (!(c)) { fails++; fprintf(stderr, "FAIL: %s (line %d)\n", msg, __LINE__); } } while (0)
++
++static int bound(const keymap *k, int code, int a) { return (k->in[code] & KM_BIT(a)) != 0; }
++
++int main(void) {
++    keymap k; char err[1024];
++    km_clear(&k);
++    CHECK(km_parse(&k, KM_DEFAULT_FILE, err, sizeof err) == 0, "the default file parses with no problem");
++    keymap d; km_defaults(&d);
++    CHECK(!memcmp(&k, &d, sizeof k), "km_defaults is the default file parsed");
++    CHECK(d.mouse_look == 1 && d.mouse_invert_y == 0 && d.mouse_sensitivity == 1.f && d.walk_speed == .5f, "default mouse and walk settings");
++    for (int a = 0; a < KM_ACTIONS; a++) { if (a == KM_RELEASE_MOUSE) continue;   // none by default: Escape is the menu, the ` key toggles
++        int any = 0; for (int i = 0; i < KM_INPUTS; i++) any |= bound(&d, i, a); CHECK(any, km_action_name(a)); }
++    for (int i = 0; i < KM_INPUTS; i++) { uint64_t m = d.in[i]; CHECK(!(m & (m - 1)), "no default key does two actions"); }
++    CHECK(bound(&d, km_input_code("E"), KM_A) && bound(&d, km_input_code("Return"), KM_A) && bound(&d, 56, KM_A), "A = E, Return, LShift (sprint)");
++    CHECK(bound(&d, KM_MOUSE_LEFT, KM_Y) && bound(&d, KM_MOUSE_RIGHT, KM_ZR) && bound(&d, KM_MOUSE_MIDDLE, KM_ZL), "mouse buttons: sword, item, target");
++    CHECK(bound(&d, 49, KM_X) && bound(&d, 53, KM_PLUS) && bound(&d, 48, KM_MINUS) && bound(&d, 12, KM_ZL), "Space jumps, Escape menu, Tab map, Q targets");
++    CHECK(bound(&d, 13, KM_LUP) && bound(&d, 0, KM_LLEFT) && bound(&d, 1, KM_LDOWN) && bound(&d, 2, KM_LRIGHT), "WASD by key code");
++    CHECK(bound(&d, 126, KM_RUP) && bound(&d, 59, KM_WALK) && bound(&d, 50, KM_TOGGLE_MOUSE), "arrows, LControl, Grave");
++    { uint64_t r = 0; for (int i = 0; i < KM_INPUTS; i++) r |= d.in[i] & KM_BIT(KM_RELEASE_MOUSE); CHECK(!r, "ReleaseMouse is none by default"); }
++    char keys[128]; km_keys_of(&d, KM_A, keys, sizeof keys);
++    CHECK(!strcmp(keys, "E, Return, LShift"), "keys of an action, in code order");
++
++    keymap o = d;
++    CHECK(km_parse(&o, "a = j   # a note\n\n  # only a note\nB = none\nwalk = Ctrl\nmouse_look = off\nmouse_sensitivity = 2.5\n", err, sizeof err) == 0, "an override file");
++    CHECK(bound(&o, km_input_code("J"), KM_A) && !bound(&o, km_input_code("E"), KM_A) && !bound(&o, 36, KM_A), "a line replaces the action's keys");
++    km_keys_of(&o, KM_B, keys, sizeof keys);
++    CHECK(!strcmp(keys, "none") && !bound(&o, KM_MOUSE_LEFT, KM_B), "none unbinds");
++    CHECK(bound(&o, 59, KM_WALK), "Ctrl is LControl");
++    CHECK(o.mouse_look == 0 && o.mouse_sensitivity == 2.5f, "settings");
++    CHECK(bound(&o, 13, KM_LUP), "actions the file does not name keep theirs");
++
++    keymap e = d;
++    CHECK(km_parse(&e, "A = Banana\nJump = Space\nmouse_sensitivity = 50\nwalk_speed = x\nmouse_look = maybe\nno equals here\n", err, sizeof err) == 6, "six bad lines");
++    CHECK(!memcmp(&e, &d, sizeof e), "bad lines change nothing");
++    CHECK(strstr(err, "line 1: unknown key \"Banana\"") && strstr(err, "line 2: unknown action \"Jump\"") && strstr(err, "line 6: no '='"), "the problems are named by line");
++    keymap two = d;
++    CHECK(km_parse(&two, "X = E\n", NULL, 0) == 0 && bound(&two, km_input_code("E"), KM_A) && bound(&two, km_input_code("E"), KM_X), "a key may do two actions");
++
++    for (size_t i = 0; i < sizeof KM_KEY_NAMES / sizeof *KM_KEY_NAMES; i++) {
++        int c = KM_KEY_NAMES[i].code;
++        CHECK(c >= 0 && c < KM_INPUTS && c != 54 && c != 55 && c != 57 && c != 63, KM_KEY_NAMES[i].name);
++    }
++    CHECK(km_input_code("Command") < 0 && km_input_code("CapsLock") < 0, "Command and Caps Lock are not bindable");
++    CHECK(km_modifier_flag(56) && km_modifier_flag(60) && km_modifier_flag(59) && km_modifier_flag(62) && km_modifier_flag(58) && km_modifier_flag(61)
++          && !km_modifier_flag(57) && !km_modifier_flag(0), "the modifier keys and their flags");
++    printf("t_keymap: %d checks, %d failed\n", checks, fails);
++    return fails != 0;
++}
+diff --git a/docs/env_switches.tsv b/docs/env_switches.tsv
+index 3ccd92d7..044940dd 100644
+--- a/docs/env_switches.tsv
++++ b/docs/env_switches.tsv
+@@ -104,6 +104,7 @@ DM_JIT_MISS_DUMP	diagnostic	Folder for the input of each `nn::jit` request a ser
+ DM_JIT_SERVE	path	Folder of a `nn::jit` image (`jit.img`, `jit.tsv`, `jit.out`): the Mac serves requests from it as the iOS app does, and the plugin does not run
+ DM_KBD	switch	`=<text>`: the system keyboard returns that text as OK without showing an input box; unset with no window, it returns cancel
+ DM_KBD_PLAYER	switch	`own` makes the Mac keyboard player 1 on its own, with controllers from player 2 on (by default the first controller shares player 1 with the keyboard)
++DM_KEYMAP	path	The Mac's keyboard and mouse bindings file (default `keymap.txt` in `DM_ROOT`, the app's Application Support folder; written with the defaults when missing, `dm/host/keymap.h`)
+ DM_KEYS	switch	Scripted input: `<seconds or f<frame>>:<key>[+key][~hold or ~f<frames>][*count/interval],…` presses buttons, sticks, touches and `Shake` at those times; `=@<file>` reads the steps from the file
+ DM_LANG	player	Game language as a language code (default `en-US`; the iOS app sets the one the IPA was packed with)
+ DM_LAUNCHER	switch	`0` skips the iOS settings screen or the Mac settings window and starts the game at once, with the saved choices (on the Mac also `--no-launcher`)
+diff --git a/docs/playing.md b/docs/playing.md
+index 99998d45..fdc50e2b 100644
+--- a/docs/playing.md
++++ b/docs/playing.md
+@@ -70,6 +70,30 @@ Joy-Con 2 and the Pro Controller 2 do not appear in macOS's Bluetooth settings:
+ 
+ The mouse pointer hides when you press a key or a controller button, or move a stick, while it is over the game picture. Moving the mouse shows it again, as does switching to another window or app.
+ 
++### Keyboard and mouse
++
++The keyboard and mouse play as player 1's controller, bound in `keymap.txt` in the game's folder (`~/Library/Application Support/nxnative/<title ID>/`, beside `env.txt`). The game writes it with the default controls at its first start: open it with **Controls > Edit Keymap…** (⌘K), change a line and save, and the game reads it again when you switch back to it (or **Controls > Reload Keymap**, ⌘⇧K). Each line binds a Switch button or stick direction to keys and mouse buttons, `A = E, Return`; the game's on-screen prompts name the Switch buttons. A line replaces that button's defaults, `none` unbinds it, and lines the game cannot read are shown in a sheet and left out.
++
++The defaults follow the Breath of the Wild / Tears of the Kingdom keyboard layout of MacNativeGames (left hand on W A S D, right hand on the mouse), moved where a game's buttons differ: Ocarina of Time sprints on a held A, so Shift presses A.
++
++| Default | Switch | In Ocarina of Time |
++|---|---|---|
++| W A S D (Left Control: walk) | Left stick | Move |
++| Mouse (captured), arrow keys | Right stick | Camera |
++| E, Return, Left Shift | A | Talk, open, climb; hold to sprint |
++| Backspace, X | B | Put away, back |
++| Space | X | Jump |
++| Left click, G | Y | Sword |
++| Q, middle click | ZL | Target, shield |
++| Right click, Left Option | ZR | Use the equipped item |
++| F / R | L / R | Item quick select |
++| Escape, I / Tab, M | + / − | Menu / map |
++| 2 (O) / 3 / 4 (N) / 5 | D-pad left / up / right / down | Ocarina (left), Navi (right) |
++| C / V | Press left / right stick | — / camera reset |
++| H | Shake | Motion controls |
++
++With `mouse_look = on` (the default) a click in the game picture captures the mouse: it hides, moving it turns the camera, and its buttons and wheel do what they are bound to. ` (`ToggleMouse`), a key bound to `ReleaseMouse` (none by default: Escape opens the game's menu), **Controls > Release Mouse** or switching to another app lets it go. `mouse_sensitivity` (0.1 to 10) and `mouse_invert_y` tune it; `mouse_look = off` makes the mouse the touchscreen again. Keys are by position on a US keyboard; the Command keys stay with macOS. `DM_KEYMAP=<path>` in `env.txt` reads another file. A `keymap.txt` written by an earlier build keeps its old keys: delete it to get these.
++
+ ## Shaders on first sight
+ 
+ Short stutters the first time a new scene appears are normal: the app compiles graphics for it once and remembers them for the next launch. What it remembered, and what the game's list names, is built before the game starts, behind "Preparing shaders" and a progress bar when that takes more than half a second.

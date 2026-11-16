@@ -1,0 +1,63 @@
+# Keyboard and mouse controls (nxnative). Edit and save this file with any text editor: the game reads it
+# again when its window becomes active (or Controls > Reload Keymap). Delete it to get these defaults back.
+#
+# The layout is MacNativeGames' Breath of the Wild / Tears of the Kingdom one (left hand on W A S D, right
+# hand on the mouse), moved where Ocarina of Time's buttons differ: this game sprints on a held A, not B,
+# so Shift presses A here (in a menu Shift confirms, like E).
+#
+# Each line:  Action = Key   or   Action = Key1, Key2   or   Action = none
+# A line replaces that action's defaults; a key may do several actions. Text after # is a note.
+# The left side is a Switch button: the game's on-screen prompts name them (A, B, X, Y, ZL ...).
+
+# ---- Mouse ----
+# mouse_look = on: click in the game window to capture the mouse; moving it turns the camera and its
+#   buttons do what they are bound to below. The ` key (or switching apps) lets it go.
+# mouse_look = off: the mouse is the Switch's touchscreen (click = touch).
+mouse_look = on
+mouse_sensitivity = 1.0      # 0.1 (slow) to 10 (fast)
+mouse_invert_y = off
+walk_speed = 0.5             # how far the left stick tilts while Walk is held, 0.1 to 1
+
+# ---- Moving and camera ----
+LUp = W
+LDown = S
+LLeft = A
+LRight = D
+RUp = Up                     # the arrow keys turn the camera too (the captured mouse does)
+RDown = Down
+RLeft = Left
+RRight = Right
+Walk = LControl              # hold to walk slowly (narrow ledges)
+
+# ---- Field ----
+A = E, Return, LShift        # talk, open, pick up, climb; hold Shift (or E) while moving to sprint
+B = Backspace, X             # put away; back out of a menu
+X = Space                    # jump
+Y = MouseLeft, G             # sword
+ZL = Q, MouseMiddle          # target (lock on), shield
+ZR = MouseRight, LOption     # use the equipped item (slingshot, bow, hookshot ...)
+L = F                        # item quick select
+R = R                        # item quick select
+DLeft = 2, O                 # ocarina
+DUp = 3
+DRight = 4, N                # talk to Navi
+DDown = 5
+LStickPress = C
+RStickPress = V              # camera reset
+Plus = Escape, I             # the game's menu (items, equipment, quest)
+Minus = Tab, M               # map
+Shake = H                    # shakes the controller while held (motion controls)
+
+# ---- Mouse capture ----
+ToggleMouse = Grave          # the ` key: let the mouse go, or take it back without clicking
+ReleaseMouse = none          # a key that only lets it go
+
+# ---- Names you can use ----
+# Letters A-Z, digits 0-9, F1-F15, Space, Return, Tab, Escape, Backspace, Delete, Up, Down, Left, Right,
+# Home, End, PageUp, PageDown, LShift, RShift, LControl, RControl, LOption, ROption,
+# Minus, Equal, LeftBracket, RightBracket, Semicolon, Quote, Comma, Period, Slash, Backslash, Grave,
+# Keypad0-Keypad9, KeypadPlus, KeypadMinus, KeypadMultiply, KeypadDivide, KeypadDecimal, KeypadEnter, KeypadEquals,
+# and while the mouse is captured: MouseLeft, MouseRight, MouseMiddle, Mouse4, Mouse5, WheelUp, WheelDown.
+# Keys are by position on a US keyboard. The Command keys stay with macOS (Command-Q quits).
+# Actions: A B X Y L R ZL ZR Plus Minus DUp DDown DLeft DRight LStickPress RStickPress Shake
+#          LUp LDown LLeft LRight RUp RDown RLeft RRight Walk ReleaseMouse ToggleMouse
